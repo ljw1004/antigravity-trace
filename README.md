@@ -12,6 +12,7 @@ This sets up hooks to capture Antigravity's activity. It writes logs in ~/antigr
 
 When a new version of Antigravity is released, this extension will deliberately break to let you know something's wrong; you'll have to reinstall or uninstall.
 
+
 ## Overview
 
 Antigravity is a fork of VSCode with two main components:
