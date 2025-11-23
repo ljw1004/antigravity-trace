@@ -1,3 +1,4 @@
 pyright
 aiohttp
 httpx[http2]
+h2
