@@ -18,7 +18,7 @@ function render(data, label) {
     } else if (data?.label === "STDIO") {
         return {
             [TITLE]: `[${data?.time}] `,
-            [INLINE]: esc(String(data?.request ?? data?.response ?? '')),
+            [INLINE]: esc(data?.endpoint + ' ' + String(data?.request ?? data?.response ?? '')),
         };
     } else if (Array.isArray(data?.functionDeclarations) && data.functionDeclarations.length === 1) {
         return {
@@ -84,7 +84,7 @@ function render(data, label) {
             body: [...responseCalls, responseText],
         });
         return {
-            [TITLE]: esc(`[${data?.time}] ${data?.endpoint} [${data?.request?.model ?? ''}]`),
+            [TITLE]: esc(`[${data?.time}] ${data?.endpoint} [${data?.request?.model ?? ''}, ${data?.duration ?? ''}s]`),
             [INLINE]: '',
             body: [...body, { [TITLE]: "[raw]", [INLINE]: "", body: data }],
             open: true,

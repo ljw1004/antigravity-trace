@@ -23,11 +23,9 @@ import sys
 import gzip
 import hashlib
 import traceback
-import subprocess
-import ssl
 from urllib.parse import urljoin
 from pathlib import Path
-from typing import Any, Awaitable, BinaryIO, Callable, List, Tuple, Literal, cast
+from typing import Any, Awaitable, BinaryIO, Callable, List, Tuple, Literal, Iterator, cast
 
 # install_shim will symlink venv adjacent to the shim
 VENV_SITE = Path(__file__).resolve().parent / f"venv/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
@@ -36,10 +34,6 @@ sys.path.insert(0, str(VENV_SITE))
 import aiohttp
 from aiohttp import web
 import httpx
-import h2.connection
-import h2.events
-import h2.config
-import h2.errors
 
 
 
@@ -55,7 +49,7 @@ TEMPLATE = """<!DOCTYPE html>
         #controls {display: none;}
         body>details {margin-top: 1ex; padding-top: 1ex; border-top: 1px solid lightgray;}
         body:not(.show-LSP) details.label-LSP,
-        body:not(.show-TLS) details.label-TLS,
+        body:not(.show-HTTPS) details.label-HTTPS,
         body:not(.show-UDS) details.label-UDS,
         body:not(.show-LLM) details.label-LLM,
         body:not(.show-CLOUD) details.label-CLOUD,
@@ -82,7 +76,7 @@ TEMPLATE = """<!DOCTYPE html>
 <body>
     <div id="controls">
         <label id="cb-LSP"><input type="checkbox" onchange="document.body.classList.toggle('show-LSP', this.checked)">lsp</label>
-        <label id="cb-TLS"><input type="checkbox" onchange="document.body.classList.toggle('show-TLS', this.checked)">tls</label>
+        <label id="cb-HTTPS"><input type="checkbox" onchange="document.body.classList.toggle('show-HTTPS', this.checked)">https</label>
         <label id="cb-UDS"><input type="checkbox" onchange="document.body.classList.toggle('show-UDS', this.checked)">uds</label>
         <label id="cb-LLM"><input type="checkbox" checked onchange="document.body.classList.toggle('show-LLM', this.checked)">llm</label>
         <label id="cb-CLOUD"><input type="checkbox" onchange="document.body.classList.toggle('show-CLOUD', this.checked)">cloud</label>
@@ -95,6 +89,27 @@ TEMPLATE = """<!DOCTYPE html>
 </html>
 <!--
 """
+
+INTERCEPTOR = """(next) => async (req) => {
+  const res = await next(req);
+  const telemetry = {
+    endpoint: `${req?.service?.typeName ?? '?'}/${req?.method?.name ?? '?'}`,
+    request: req?.message?.toJson ? req.message.toJson() : (req?.message ?? '?'),
+    req_headers: Object.fromEntries(req?.header?.entries?.() ?? []),
+    response: res?.message?.toJson ? res.message.toJson() : (res?.message ?? '?'),
+    resp_headers: Object.fromEntries(res?.header?.entries?.() ?? []),
+  };
+  if (!globalThis.sock_trace || globalThis.sock_trace.destroyed) {
+    const net = require("net");
+    globalThis.sock_trace = net.createConnection({path:`/tmp/antigravity-trace.${this.httpsPort}.sock`});
+    globalThis.sock_trace.on('error', () => {globalThis.sock_trace = undefined;});
+    globalThis.sock_trace.on('close', () => {globalThis.sock_trace = undefined;});
+  }
+  if (globalThis.sock_trace?.writable) {
+    globalThis.sock_trace.write(JSON.stringify(telemetry) + "\\n");
+  }
+  return res;
+}"""
 
 def install_shim(argv: list[str]) -> None:
     if len(argv) > 2 or (len(argv) == 2 and argv[1] not in ["--verbose","--uninstall"]):
@@ -119,30 +134,14 @@ def install_shim(argv: list[str]) -> None:
     version = pkg["version"]
     pkg["version"] = "99.99.99"
     (DST / "package.json").write_text(json.dumps(pkg, indent=2) + "\n")
-    # patch extension.js so it will use our self-signed TLS certificate
+    # patch extension.js to add some logging
     src = (SRC / "dist/extension.js").read_text()
-    src = src.replace('nodeOptions:{', 'nodeOptions:{rejectUnauthorized:false,')
+    src = src.replace('interceptors:[e,t]', f"interceptors:[e,t,{INTERCEPTOR}]")
     (DST / "dist/extension.js").write_text(src)
     # shim the Go binary
     shutil.copyfile(Path(__file__), DST / "bin/language_server_macos_arm")
     os.chmod(DST / "bin/language_server_macos_arm", 0o755)
     shutil.copyfile(Path(__file__).parent / "antigravity-trace.js", DST / "bin/antigravity-trace.js")
-    # self-signed cert
-    cert_path = DST / "bin" / "antigravity-trace.pem"
-    key_tmp = cert_path.with_suffix(".keytmp")
-    crt_tmp = cert_path.with_suffix(".crttmp")
-    subprocess.check_call([
-        "openssl","req","-x509","-newkey","rsa:2048","-nodes",
-        "-days","3650","-subj","/CN=localhost",
-        "-addext","subjectAltName = DNS:localhost,IP:127.0.0.1",
-        "-keyout", str(key_tmp),"-out", str(crt_tmp)
-    ])
-    with open(cert_path, "wb") as out:
-        out.write(Path(key_tmp).read_bytes())
-        out.write(Path(crt_tmp).read_bytes())
-    os.chmod(cert_path, 0o600)
-    key_tmp.unlink()
-    crt_tmp.unlink()
     # helper files for our shim
     (DST / "bin/antigravity-trace.json").write_text(json.dumps({"verbose":verbose, "version":version}))
     (DST / "bin/venv").symlink_to(Path(__file__).resolve().parent / "venv")
@@ -184,7 +183,7 @@ class Log:
         }
         return {k: ("[REDACTED]" if k.lower() in blocklist else v) for k, v in h.items()}
 
-    def trace(self, label: Literal["STDIO", "EXTENSION", "INFERENCE", "API", "CLOUD", "TLS", "LSP", "UDS"], endpoint: str, request: str | bytes | None, req_headers: dict[str,str] | None, response: str | bytes | None, resp_headers: dict[str,str] | None) -> None:
+    def trace(self, label: Literal["STDIO", "EXTENSION", "INFERENCE", "API", "CLOUD", "HTTPS", "LSP", "UDS"], endpoint: str, startTime: datetime, request: str | bytes | None, req_headers: dict[str,str] | None, response: str | bytes | None, resp_headers: dict[str,str] | None) -> None:
         # The job of this function should be to log absolutely everything in jsonl.
         # But, the traffic is so voluminous that we have to be selective! The bulk of this function
         # centers around computing deltas to keep the logs small.
@@ -232,8 +231,14 @@ class Log:
         if 'UpdateCascadeTrajectorySummaries' in endpoint:
             request2 = {k: v for k, v in request2.items() if k.startswith(("+", "-"))}
 
-        # TODO: currently we're only recording end-time. I'd like to record start-time, TTFT, TTC
-        d: dict[str,Any] = {"label": label, "endpoint": endpoint, "time": datetime.now().strftime("%H:%M:%S.%f")[:-3]}
+        now = datetime.now()
+        d: dict[str,Any] = {
+            "label": label,
+            "endpoint": endpoint,
+            "time": startTime.strftime("%H:%M:%S.%f")[:-3],
+            "endTime": now.strftime("%H:%M:%S.%f")[:-3],
+            "duration": round((now - startTime).total_seconds(), 3),
+        }
         if request2 is not None:
             d["request"] = request2
         if req_headers is not None:
@@ -276,11 +281,11 @@ def delta(prev: Any, new: Any) -> Tuple[bool, Any]:
                 if len(json.dumps(newl[k])) < 128:
                     d[k] = newl[k]
                 elif isinstance(newl[k], dict):
-                    d[k] = {"unchanged":"unchanged"}
+                    d[k] = {"[unchanged]":"[unchanged]"}
                 elif isinstance(newl[k], list):
                     d[k] = ["..."]
                 elif isinstance(newl[k], str):
-                    d[k] = "unchanged"
+                    d[k] = "[unchanged]"
                 continue
             if not isinstance(subdelta, list) or (subdelta[0] != "---" and subdelta[0] != "..."):
                 d[f"*{k}"] = subdelta
@@ -293,7 +298,7 @@ def delta(prev: Any, new: Any) -> Tuple[bool, Any]:
                 d[f"{k}-"] = removals
             if len(additions) > 0:
                 d[f"{k}+"] = additions
-        return (len(d) == 0, "{repeat}" if len(d) == 0 else d)
+        return (len(d) == 0, "{[repeat]}" if len(d) == 0 else d)
     elif isinstance(prev, list) and isinstance(new, list):
         prevl = [(v,blake2b(json.dumps(v, sort_keys=True))) for v in cast(list[Any], prev)]
         newl = [(v,blake2b(json.dumps(v, sort_keys=True))) for v in cast(list[Any], new)]
@@ -450,172 +455,59 @@ class Protobuf:
         return bytes(buf)
 
 
-class TLS_HTTP2_Bridge:
-    def __init__(self, log: Log, go_host: str, go_port: int):
-        self.go_host = go_host
-        self.go_port = go_port
-        self.log = log
+async def start_https_proxy(log: Log, go_port: int) -> Callable[[], Awaitable[None]]:
+    # The INTERCEPTOR which we injected into extension.js will write jsonl logs to this socket:
+    path = Path(f"/tmp/antigravity-trace.{go_port}.sock")
+    path.unlink(missing_ok=True)
 
-    async def handle_client(self, ext_reader: asyncio.StreamReader, ext_writer: asyncio.StreamWriter) -> None:
-        # TLS client to upstream
-        ctx_to_connect_to_go = ssl.create_default_context()
-        ctx_to_connect_to_go.check_hostname = False
-        ctx_to_connect_to_go.verify_mode = ssl.CERT_NONE
-        ctx_to_connect_to_go.set_alpn_protocols(["h2"])
-        go_reader, go_writer = await asyncio.open_connection(
-            self.go_host, self.go_port, ssl=ctx_to_connect_to_go, server_hostname=self.go_host
-        )
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            jj: dict[str, Any] = json.loads(line)
+            if '/Heartbeat' not in jj["endpoint"]:
+                log.trace("HTTPS", jj["endpoint"], datetime.now(), json.dumps(jj["request"]),jj["req_headers"], json.dumps(jj["response"]), jj["resp_headers"])
+        with contextlib.suppress(Exception):
+            writer.close()
+            await writer.wait_closed()
 
-        # h2 state machines. "Go" is the server and "Ext" is the client
-        conn_state_with_ext = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=False))
-        conn_state_with_go = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True))
-        conn_state_with_ext.initiate_connection()
-        conn_state_with_go.initiate_connection()
-        ext_writer.write(conn_state_with_ext.data_to_send())
-        go_writer.write(conn_state_with_go.data_to_send())
-
-        async def ext_reader_loop() -> None:            
-            try:
-                while True:
-                    tt: list[str] = []
-                    tn: list[str] = []
-                    data = await ext_reader.read(65536)
-                    if data:
-                        incs: dict[int | None, int] = {}
-                        for ev in conn_state_with_ext.receive_data(data):
-                            self._handle_event_from_go(ev, conn_state_with_go, go_writer,incs)
-                            tn.append(type(ev).__name__)
-                            tt.append(f"{type(ev).__name__} - {repr(ev)}")
-                        for stream_id, i in incs.items():
-                            conn_state_with_ext.increment_flow_control_window(i, stream_id) if i > 0 else None
-                        self.log.trace("TLS", "ext->go " + ",".join(tn),json.dumps(tt),None,None,None)
-
-                    ext_writer.write(conn_state_with_ext.data_to_send())
-                    go_writer.write(conn_state_with_go.data_to_send())
-                    await ext_writer.drain()
-                    await go_writer.drain()
-                    if not data:
-                        break
-            except Exception as e:
-                self.log.trace("TLS", "ext->go *** ERROR", str(e) + "\n" + repr(traceback.format_exc()), None, None, None)
-
-        async def go_reader_loop() -> None:
-            try:
-                while True:
-                    tt: list[str] = []
-                    tn: list[str] = []
-                    data = await go_reader.read(65536)
-                    if data:
-                        incs: dict[int | None, int] = {}
-                        for ev in conn_state_with_go.receive_data(data):
-                            self._handle_event_from_go(ev, conn_state_with_ext, ext_writer,incs)
-                            tn.append(type(ev).__name__)
-                            tt.append(f"{type(ev).__name__} - {repr(ev)}")
-                        for stream_id, i in incs.items():
-                            conn_state_with_go.increment_flow_control_window(i, stream_id) if i > 0 else None
-                        self.log.trace("TLS", "go->ext " + ",".join(tn),json.dumps(tt),None,None,None)
-
-                    ext_writer.write(conn_state_with_ext.data_to_send())
-                    go_writer.write(conn_state_with_go.data_to_send())
-                    await ext_writer.drain()
-                    await go_writer.drain()
-                    if not data:
-                        break
-            except Exception as e:
-                self.log.trace("TLS", "go->ext *** ERROR", str(e) + "\n" + repr(traceback.format_exc()), None, None, None)
-            
-        await asyncio.gather(ext_reader_loop(), go_reader_loop(), return_exceptions=True)
-        ext_writer.close()
-        go_writer.close()
-        await ext_writer.wait_closed()
-        await go_writer.wait_closed()
-
-    def _handle_event_from_go(
-        self,
-        event: h2.events.Event,
-        conn_state_with_ext: h2.connection.H2Connection,
-        ext_writer: asyncio.StreamWriter,
-        incs: dict[int | None, int],
-    ) -> None:
-        """The naming of this function reflects its use in the go_reader_loop.
-        It's also used in the ext_reader_loop, but there all the names in this function are backwards!"""
-        if isinstance(event, h2.events.RequestReceived):
-            conn_state_with_ext.send_headers(event.stream_id, list(event.headers), end_stream=bool(event.stream_ended))
-            if bool(event.stream_ended):
-                incs[event.stream_id] = -1
-        elif isinstance(event, h2.events.ResponseReceived):
-            conn_state_with_ext.send_headers(event.stream_id, list(event.headers), end_stream=bool(event.stream_ended))
-            if bool(event.stream_ended):
-                incs[event.stream_id] = -1
-        elif isinstance(event, h2.events.InformationalResponseReceived):
-            conn_state_with_ext.send_headers(event.stream_id, event.headers, end_stream=False)
-        elif isinstance(event, h2.events.TrailersReceived):
-            conn_state_with_ext.send_headers(event.stream_id, event.headers, end_stream=bool(event.stream_ended))
-            if bool(event.stream_ended):
-                incs[event.stream_id] = -1
-        elif isinstance(event, h2.events.DataReceived):
-            conn_state_with_ext.send_data(event.stream_id, event.data, end_stream=bool(event.stream_ended))
-            ext_writer.write(conn_state_with_ext.data_to_send())
-            # Our caller will have to increment the overall window incs[None], and also the window of this stream incs[stream_id]
-            # Except, if this stream is ended (by us, or previously, or later) then our caller must not increment this stream's window
-            # The incrementing has to be done by our caller outside their "for event in ..." loop, because if a chunk had
-            # DataReceived first followed by something that ended the stream, then the stream's state reflects the end of
-            # chunk processing even as we start our iteration through events, and we can't increment a stream that's ended.
-            incs[None] = incs.get(None,0) + event.flow_controlled_length
-            i = incs.get(event.stream_id,0)
-            incs[event.stream_id] = i + event.flow_controlled_length if i >= 0 and bool(event.stream_ended) == False else -1
-        elif isinstance(event, h2.events.StreamEnded):
-            # This is fired when "stream has been ended by remote party"
-            # We can't call end_stream() because (1) this is just a notification of an end_stream that got sent in another packet,
-            # if we tried, it would fail "can't SEND_END_STREAM in state HALF_CLOSED_LOCAL", and a side effect
-            # of that failure is to transition into fully CLOSED state, which would be wrong because we're really
-            # only half closed and might very well get more data.
-            pass
-        elif isinstance(event, h2.events.StreamReset):
-            conn_state_with_ext.reset_stream(event.stream_id, event.error_code)
-        elif isinstance(event, h2.events.RemoteSettingsChanged):
-            new_settings = {k: v.new_value for k, v in event.changed_settings.items()}
-            conn_state_with_ext.update_settings(new_settings)
-        elif isinstance(event, h2.events.PriorityUpdated):
-            conn_state_with_ext.prioritize(
-                event.stream_id or 0,
-                weight=event.weight,
-                depends_on=event.depends_on,
-                exclusive=event.exclusive
-            )
-        elif isinstance(event, h2.events.WindowUpdated):
-            pass
-        elif isinstance(event, (h2.events.PingReceived, h2.events.PingAckReceived)):
-            pass  # is auto-acked
-        elif isinstance(event, h2.events.ConnectionTerminated):
-            conn_state_with_ext.close_connection(
-                error_code=event.error_code or h2.errors.ErrorCodes.NO_ERROR,
-                last_stream_id=event.last_stream_id,
-            )
-            ext_writer.close()
-        elif isinstance(event, h2.events.SettingsAcknowledged):
-            pass
-        else:
-            raise Exception(f"Unexpected {type(event).__name__}")
-
-
-async def start_tls_proxy(log: Log, go_port: int) -> tuple[int, Callable[[], Awaitable[None]]]:
-    cert_path = DST / "bin" / "antigravity-trace.pem"
-    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    server_ctx.load_cert_chain(certfile=cert_path)
-    server_ctx.set_alpn_protocols(["h2"])
-
-    bridge = TLS_HTTP2_Bridge(log, "127.0.0.1", go_port)
-    
-    server = await asyncio.start_server(
-        bridge.handle_client, host="127.0.0.1", port=0, ssl=server_ctx
-    )
-    proxy_port = server.sockets[0].getsockname()[1]
+    server = await asyncio.start_unix_server(handle, path=str(path))
 
     async def cleanup() -> None:
-        server.close(); await server.wait_closed()
+        server.close()
+        await server.wait_closed()
+        path.unlink(missing_ok=True)
 
-    return proxy_port, cleanup
+    return cleanup
+
+
+class JsonrpcStreamReader:
+    def __init__(self) -> None:
+        self._buf = bytearray()
+
+    def feed(self, data: bytes) -> Iterator[str]:
+        """Consume a new chunk of bytes, yielding each complete JSON message as soon as it's available."""
+        self._buf.extend(data)
+        while True:
+            header_end = self._buf.find(b"\r\n\r\n")
+            if header_end == -1:
+                break  # need more header bytes
+            header_block = self._buf[:header_end].decode("latin1", errors="replace")
+            content_length: int | None = None
+            for key, value in [line.split(":", 1) for line in header_block.split("\r\n") if line and ":" in line]:
+                if key.strip().lower() == "content-length":
+                    content_length = int(value.strip())
+            if content_length is None:
+                raise ValueError("missing Content-Length header")
+
+            frame_end = header_end + 4 + content_length
+            if len(self._buf) < frame_end:
+                break  # wait for more body bytes
+
+            body = bytes(self._buf[header_end + 4 : frame_end])
+            del self._buf[:frame_end]
+            yield body.decode("utf-8")
 
 
 async def start_lsp_proxy(log: Log, go_port: int) -> tuple[int, Callable[[], Awaitable[None]]]:
@@ -623,23 +515,26 @@ async def start_lsp_proxy(log: Log, go_port: int) -> tuple[int, Callable[[], Awa
     async def handle(proxy_reader: asyncio.StreamReader, proxy_writer: asyncio.StreamWriter) -> None:
         go_reader, go_writer = await asyncio.open_connection("127.0.0.1", go_port)
 
-        async def forward(src: asyncio.StreamReader, dst: asyncio.StreamWriter, direction: str) -> None:
+        async def forward(src: asyncio.StreamReader, dst: asyncio.StreamWriter, direction: Literal["extension->go", "extension<-go"]) -> None:
             try:
+                reader = JsonrpcStreamReader()
                 while True:
                     chunk = await src.read(64 * 1024)
                     if not chunk:
                         break
-                    log.trace("LSP", direction, None, None,pretty(chunk), None)
                     dst.write(chunk)
+                    for message in reader.feed(chunk):
+                        req, resp = (message, None) if direction == "extension->go" else (None, message)
+                        log.trace("LSP", direction + ":" + json.loads(message).get('method','[response]'), datetime.now(), req, None, resp, None)
                     await dst.drain()
             except Exception as e:
-                log.trace("LSP", direction + " *** ERROR", str(e) + "\n" + repr(traceback.format_exc()), None, None, None)
+                log.trace("LSP", direction + " *** ERROR", datetime.now(), str(e) + "\n" + repr(traceback.format_exc()), None, None, None)
             finally:
                 with contextlib.suppress(Exception):
                     dst.close(); await dst.wait_closed()
 
         fwd1 = asyncio.create_task(forward(proxy_reader, go_writer, "extension->go"))
-        fwd2 = asyncio.create_task(forward(go_reader, proxy_writer, "go->extension"))
+        fwd2 = asyncio.create_task(forward(go_reader, proxy_writer, "extension<-go"))
         _done, pending = await asyncio.wait({fwd1, fwd2}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
@@ -659,11 +554,11 @@ async def start_lsp_proxy(log: Log, go_port: int) -> tuple[int, Callable[[], Awa
 async def start_extension_proxy(log: Log, target_port: int) -> tuple[int, Callable[[], Awaitable[None]]]:
     session = aiohttp.ClientSession(auto_decompress=False)
 
-    cleanup0: Callable[[], Awaitable[None]] | None = None
-    cleanup1: Callable[[], Awaitable[None]] | None = None
+    cleanup_https: Callable[[], Awaitable[None]] | None = None
+    cleanup_lsp: Callable[[], Awaitable[None]] | None = None
 
     async def handle(request: web.Request) -> web.StreamResponse:
-        nonlocal cleanup0, cleanup1
+        nonlocal cleanup_lsp, cleanup_https
         req_body = await request.read()
         url = f"http://127.0.0.1:{target_port}{request.rel_url}"
 
@@ -675,12 +570,8 @@ async def start_extension_proxy(log: Log, target_port: int) -> tuple[int, Callab
         if "/LanguageServerStarted" in str(request.rel_url):
             vals = Protobuf.decode_int_list(req_body)
             if vals and len(vals) == 3:
-                # port0, tcleanup0 = await start_tls_proxy(log, vals[0])  # It's causing bugs; disabled for now
-                # vals[0] = port0
-                # cleanup0 = tcleanup0
-                port1, tcleanup1 = await start_lsp_proxy(log, vals[1])
-                vals[1] = port1
-                cleanup1 = tcleanup1
+                cleanup_https = await start_https_proxy(log, vals[0])
+                vals[1], cleanup_lsp = await start_lsp_proxy(log, vals[1])
                 req_body = Protobuf.encode_int_list(vals)
 
         async with session.request(
@@ -691,7 +582,7 @@ async def start_extension_proxy(log: Log, target_port: int) -> tuple[int, Callab
         ) as resp:
             resp_body = await resp.read()
             log_body = gzip.decompress(resp_body) if resp.headers.get("content-encoding", "") == "gzip" else resp_body
-            log.trace("EXTENSION", str(request.rel_url), req_body, dict(request.headers), log_body, dict(resp.headers))
+            log.trace("EXTENSION", str(request.rel_url), datetime.now(), req_body, dict(request.headers), log_body, dict(resp.headers))
             headers = {k: v for k, v in resp.headers.items() if k.lower() != "content-length"}
             return web.Response(status=resp.status, headers=headers, body=resp_body)
 
@@ -706,10 +597,10 @@ async def start_extension_proxy(log: Log, target_port: int) -> tuple[int, Callab
     async def cleanup() -> None:
         await runner.cleanup()
         await session.close()
-        if cleanup0:
-            await cleanup0()
-        if cleanup1:
-            await cleanup1()
+        if cleanup_lsp:
+            await cleanup_lsp()
+        if cleanup_https:
+            await cleanup_https()
 
     return port, cleanup
 
@@ -727,6 +618,7 @@ async def start_web_proxy(log: Log, base_url_str: str, label: Literal["INFERENCE
 
     async def handle(request: web.Request) -> web.StreamResponse:
         req_body = await request.read()
+        startTime = datetime.now()
         async with session.stream(
             request.method,
             urljoin(base_url_str, request.raw_path),
@@ -748,7 +640,7 @@ async def start_web_proxy(log: Log, base_url_str: str, label: Literal["INFERENCE
             await stream.write_eof()
             resp_body = b''.join(resp_body_chunks)
             log_body = gzip.decompress(resp_body) if resp.headers.get("content-encoding", "") == "gzip" else resp_body
-            log.trace(label, str(request.rel_url), req_body, dict(request.headers), log_body, dict(resp.headers))
+            log.trace(label, str(request.rel_url), startTime, req_body, dict(request.headers), log_body, dict(resp.headers))
         return stream
 
     app = web.Application()
@@ -781,7 +673,7 @@ async def start_uds_proxy(log: Log, target_path: str) -> tuple[str, Callable[[],
         try:
             target_reader, target_writer = await asyncio.open_unix_connection(target_path)
         except Exception as e:
-            log.trace("UDS", "dial_failed", str(proxy_path), None, str(e), None)
+            log.trace("UDS", "dial_failed", datetime.now(), str(proxy_path), None, str(e), None)
             writer.close()
             await writer.wait_closed()
             return
@@ -792,11 +684,11 @@ async def start_uds_proxy(log: Log, target_path: str) -> tuple[str, Callable[[],
                     chunk = await src.read(64 * 1024)
                     if not chunk:
                         break
-                    log.trace("UDS", direction, None, None, pretty(chunk), None)
+                    log.trace("UDS", direction, datetime.now(), None, None, pretty(chunk), None)
                     dst.write(chunk)
                     await dst.drain()
             except Exception as e:
-                log.trace("UDS", direction + " *** ERROR", str(e) + "\n" + repr(traceback.format_exc()), None, None, None)
+                log.trace("UDS", direction + " *** ERROR", datetime.now(), str(e) + "\n" + repr(traceback.format_exc()), None, None, None)
             finally:
                 with contextlib.suppress(Exception):
                     dst.close()
@@ -849,7 +741,7 @@ async def shim() -> None:
     if config["version"] != pkg["version"]:
         sys.exit(f"Shim is out of date. You must reinstall it.")
     log = Log(config["verbose"])
-    log.trace("STDIO", "cmdline", ' '.join(sys.argv), None, None, None)
+    log.trace("STDIO", "cmdline", datetime.now(), ' '.join(sys.argv), None, None, None)
 
     args = parse_argv(sys.argv[1:])
 
@@ -876,7 +768,7 @@ async def shim() -> None:
     assert proc.stdout is not None
     assert proc.stderr is not None
 
-    async def pump_output(reader: asyncio.StreamReader, writer: BinaryIO, label: str) -> None:
+    async def pump_output(reader: asyncio.StreamReader, writer: BinaryIO, label: Literal["STDOUT","STDERR"]) -> None:
         while True:
             chunk = await reader.read(64 * 1024)
             if not chunk:
@@ -885,10 +777,10 @@ async def shim() -> None:
             too_wordy = [b"could not convert a single message before hitting truncation",
                 b"queryText was truncated",
                 b") exceeds limit ("]
-            if label == "stderr" and any((w in chunk for w in too_wordy)):
+            if label == "STDERR" and any((w in chunk for w in too_wordy)):
                 pass
             else:
-                log.trace("STDIO", label, None, None, chunk, None)
+                log.trace("STDIO", label, datetime.now(), None, None, chunk, None)
             try:
                 writer.write(chunk)
                 writer.flush()
@@ -901,7 +793,7 @@ async def shim() -> None:
                 chunk = await asyncio.to_thread(sys.stdin.buffer.read, 64 * 1024)
                 if not chunk:
                     break
-                log.trace("STDIO", "stdin", chunk, None, None, None)
+                log.trace("STDIO", "STDIN", datetime.now(), chunk, None, None, None)
                 assert proc.stdin is not None
                 proc.stdin.write(chunk)
                 await proc.stdin.drain()
@@ -912,8 +804,8 @@ async def shim() -> None:
                 await proc.stdin.wait_closed()
 
 
-    stdout = asyncio.create_task(pump_output(proc.stdout, sys.stdout.buffer, "stdout"))
-    stderr = asyncio.create_task(pump_output(proc.stderr, sys.stderr.buffer, "stderr"))
+    stdout = asyncio.create_task(pump_output(proc.stdout, sys.stdout.buffer, "STDOUT"))
+    stderr = asyncio.create_task(pump_output(proc.stderr, sys.stderr.buffer, "STDERR"))
     stdin = asyncio.create_task(pump_input())
     returncode = await proc.wait()
 
