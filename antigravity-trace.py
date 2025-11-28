@@ -551,6 +551,8 @@ async def start_lsp_proxy(log: Log, go_port: int) -> tuple[int, Callable[[], Awa
 
     return proxy_port, cleanup
 
+HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "content-length"}
+
 async def start_extension_proxy(log: Log, target_port: int) -> tuple[int, Callable[[], Awaitable[None]]]:
     session = aiohttp.ClientSession(auto_decompress=False)
 
@@ -580,11 +582,20 @@ async def start_extension_proxy(log: Log, target_port: int) -> tuple[int, Callab
             headers=request.headers,
             data=req_body,
         ) as resp:
-            resp_body = await resp.read()
-            log_body = gzip.decompress(resp_body) if resp.headers.get("content-encoding", "") == "gzip" else resp_body
-            log.trace("EXTENSION", str(request.rel_url), datetime.now(), req_body, dict(request.headers), log_body, dict(resp.headers))
-            headers = {k: v for k, v in resp.headers.items() if k.lower() != "content-length"}
-            return web.Response(status=resp.status, headers=headers, body=resp_body)
+            headers = {k: v for k, v in resp.headers.items() if k.lower() not in HOP_HEADERS}
+            response = web.StreamResponse(status=resp.status, headers=headers)
+            await response.prepare(request)
+
+            resp_body_chunks: list[bytes] = []
+            async for chunk in resp.content.iter_any():
+                resp_body_chunks.append(chunk)
+                await response.write(chunk)
+            await response.write_eof()
+            
+            resp_body = b"".join(resp_body_chunks)
+            log_resp_body = gzip.decompress(resp_body) if resp.headers.get("content-encoding", "") == "gzip" or resp.headers.get("connect-content-encoding", "") == "gzip" else resp_body
+            log.trace("EXTENSION", str(request.rel_url), datetime.now(), req_body, dict(request.headers), log_resp_body, dict(resp.headers))
+            return response
 
     app = web.Application()
     app.router.add_route("*", "/{path:.*}", handle)
@@ -628,7 +639,7 @@ async def start_web_proxy(log: Log, base_url_str: str, label: Literal["INFERENCE
             out_headers: dict[str, str] = {
                 k: v
                 for k, v in resp.headers.items()
-                if k.lower() not in {"content-length", "connection"}
+                if k.lower() not in HOP_HEADERS
             }
             stream = web.StreamResponse(status=resp.status_code, headers=out_headers)
             await stream.prepare(request)
@@ -639,8 +650,8 @@ async def start_web_proxy(log: Log, base_url_str: str, label: Literal["INFERENCE
                 await stream.write(chunk)
             await stream.write_eof()
             resp_body = b''.join(resp_body_chunks)
-            log_body = gzip.decompress(resp_body) if resp.headers.get("content-encoding", "") == "gzip" else resp_body
-            log.trace(label, str(request.rel_url), startTime, req_body, dict(request.headers), log_body, dict(resp.headers))
+            log_resp_body = gzip.decompress(resp_body) if resp.headers.get("content-encoding", "") == "gzip" or resp.headers.get("connect-content-encoding", "") == "gzip" else resp_body
+            log.trace(label, str(request.rel_url), startTime, req_body, dict(request.headers), log_resp_body, dict(resp.headers))
         return stream
 
     app = web.Application()
